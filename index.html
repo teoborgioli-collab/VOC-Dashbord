@@ -1379,6 +1379,20 @@ function baselineMatchScore(ex,b){
   // Baseline identity must be independent of how the chart is formatted.
   return score;
 }
+function baselineFieldsConflict(ex,b){
+  // True when a stock-defining metadata field is present on both sides but disagrees
+  // (e.g. Substrate=SubA vs Substrate=SubB). Used to stop the single-stock fallback in
+  // baselineRowsFor from sharing a stock with a sample it demonstrably does not belong to.
+  const normMeta=v=>String(v==null?'':v).toLowerCase()
+    .replace(/\b(protein[\s._-]*stock|prot[\s._-]*stock|stock|protein|prot|baseline|reference)\b/g,' ')
+    .replace(/\s+/g,' ').trim();
+  return usefulBaselineFields().some(f=>{
+    const ev=valueForField(ex,f), bv=valueForField(b,f);
+    if(!ev||!bv||ev==='none'||bv==='none') return false;
+    const ne=normMeta(ev), nb=normMeta(bv);
+    return ne!=='' && nb!=='' && ne!==nb;
+  });
+}
 function baselineRowsFor(compound,traceRows,allData){
   // Resolve THIS sample's own stock by IDENTITY first, independent of the compound,
   // then read only this compound from that stock. Never borrow another stock.
@@ -1405,9 +1419,13 @@ function baselineRowsFor(compound,traceRows,allData){
     own=cand.filter(c=>c.score===best);              // the sample's own matched stock(s)
   }else{
     // No identity signal at all: only a single global/common stock may be shared;
-    // if several distinct stocks exist and none matches, do not borrow.
+    // if several distinct stocks exist and none matches, do not borrow. Even with a
+    // single stock, do not share it if a metadata field (e.g. Substrate) is present on
+    // both sides and explicitly disagrees -- that means the sample belongs to a
+    // different substrate/condition that simply has no stock of its own.
     const cores=[...new Set(allBaseline.map(b=>firstIdentityCandidate(identityCandidateSetFromRow(b))).filter(Boolean))];
-    if(cores.length<=1) own=cand; else return [];
+    const conflicts=cand.some(c=>baselineFieldsConflict(ex,c.rows[0]));
+    if(cores.length<=1 && !conflicts) own=cand; else return [];
   }
   // Within the resolved own stock only, return this compound's detected rows.
   return own.flatMap(c=>c.rows).filter(b=>b.Compound===compound && Number.isFinite(b.Peak_Area) && (nonDetectsAsZero()?b.Peak_Area>=0:b.Peak_Area>0));
@@ -3403,6 +3421,18 @@ function rawGroupFoldReference(compoundSet,exampleRow,allData){
   });
   return {refSum,n};
 }
+function baselineRowsForWithFallback(compound,exampleRow,allData){
+  // Same resolution order as matchedBaselineMeanForRow: matched protein-stock first
+  // (baselineRowsFor, identity-scored, never borrowed from an unrelated stock), then
+  // this sample's own Day 0 fermentation point when no stock matches at all.
+  const all=allData||currentData||[];
+  let base=[];
+  try{ base=baselineRowsFor(compound,[exampleRow],all); }catch(e){ base=[]; }
+  if(base.length) return base;
+  const code=exampleRow?.Sample_Code;
+  if(code==null) return [];
+  return all.filter(x=>x.Compound===compound && x.Sample_Code===code && x.Day===0 && Number.isFinite(x.Peak_Area) && x.Peak_Area>0);
+}
 function summedFoldChangeForRows(arr,compoundSet,exampleRow){
   // Correct group fold-change: log2(sum raw sample area / sum raw matched baseline area).
   // Inclusion is based on the matched baseline, not on positive endpoint detection:
@@ -3415,8 +3445,7 @@ function summedFoldChangeForRows(arr,compoundSet,exampleRow){
   let rawSum=0, refSum=0, n=0;
   compoundSet.forEach(c=>{
     const sampleRaw=rows.filter(d=>d.Compound===c).reduce((s,d)=>s+(Number.isFinite(d.Peak_Area)&&d.Peak_Area>0?d.Peak_Area:0),0);
-    let base=[];
-    try{ base=baselineRowsFor(c,[exampleRow||rows[0]],currentData||[]); }catch(e){ base=[]; }
+    const base=baselineRowsForWithFallback(c,exampleRow||rows[0],currentData);
     const refs=(base||[]).map(b=>b.Peak_Area).filter(v=>Number.isFinite(v)&&v>0);
     if(refs.length){ rawSum+=sampleRaw; refSum+=mean(refs); n+=1; }
   });
@@ -3728,6 +3757,12 @@ function updateSingleCompoundChart(){
   const mode=byId('exploreMode')?.value||'compound';
   const agg=exploreAgg();
   const norm=exploreNorm();
+  // Summed-group traces must use the correct "sum raw areas, then one log2" fold-change
+  // formula (aggregateGroup's norm==='fold' branch) instead of exploreBaseValue's
+  // per-row fold-change, which would otherwise get summed across compounds -- i.e.
+  // adding individual log2 fold-changes together, which the analysis explicitly must not do.
+  // Only affects the summed-trace calls below; per-compound lines keep using `norm`.
+  const summedNorm=(norm==='none' && dataMode()==='foldChange')?'fold':norm;
   const data=filterData();
 
   // ---- single compound ----
@@ -3750,7 +3785,7 @@ function updateSingleCompoundChart(){
       const comps=allCompounds.filter(c=>cg(c)===g && data.some(d=>d.Compound===c&&!d.IsBaseline));
       if(!comps.length)return;
       groupCounts.push(`${g} (${comps.length})`);
-      traces.push(...makeSummedTraces(denseRowsForCompounds(data,comps),new Set(comps),norm,g,{bold:true}));
+      traces.push(...makeSummedTraces(denseRowsForCompounds(data,comps),new Set(comps),summedNorm,g,{bold:true}));
     });
     if(!traces.length){target.innerHTML='<div class="hint" style="padding:20px">No compounds from the selected VOC groups are present in the current filters.</div>';return;}
     const normTag=norm!=='none'?' · '+normUnitLabel(norm):'';
@@ -3797,7 +3832,7 @@ function updateSingleCompoundChart(){
   }
   if(agg==='sum'){
     const t=(mode==='custom'?'Summed Custom Set':smartExploreTitle('sum',groupName,ranked.length,fullCompoundList.length))+normTag;
-    const sumTraces=makeSummedTraces(denseRowsForCompounds(data,fullCompoundList),summedSet,norm,groupName);
+    const sumTraces=makeSummedTraces(denseRowsForCompounds(data,fullCompoundList),summedSet,summedNorm,groupName);
     let lay=lineChartLayout(t,chartHeight()); lay.yaxis=exploreYLayout(norm);
     lay=applySummedAnnotationLegend(lay,sumTraces);
     plotLineWithGlobalRange(target,sumTraces,lay,plotConfig(t));
@@ -3807,7 +3842,7 @@ function updateSingleCompoundChart(){
   const t=(mode==='custom'?`Summed Custom Set + ${ranked.length} Individual Compounds`:smartExploreTitle('sum_individual',groupName,ranked.length,fullCompoundList.length))+normTag;
   let lay=lineChartLayout(t,chartHeight()); lay.yaxis=exploreYLayout(norm);
   const indiv=makeIndividualNormTraces(denseRowsForCompounds(data,ranked),ranked,norm,{thin:true});
-  const summed=makeSummedTraces(denseRowsForCompounds(data,fullCompoundList),summedSet,norm,groupName,{bold:true});
+  const summed=makeSummedTraces(denseRowsForCompounds(data,fullCompoundList),summedSet,summedNorm,groupName,{bold:true});
   const combined=[...indiv,...summed];
   lay=applySummedAnnotationLegend(lay,combined);
   plotLineWithGlobalRange(target,combined,lay,plotConfig(t));
